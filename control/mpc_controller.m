@@ -7,77 +7,54 @@ function result = mpc_controller( ...
     ref_speed)
 
 % ============================================================
-% INDRA - MPC VEHICLE CONTROLLER
+% INDRA - MPC VEHICLE CONTROLLER FINAL
 % Adaptive Closed-Loop Vehicle Control
 %
-% Inputs:
-%   ego_speed    - current vehicle speed (m/s)
-%   ego_y        - current lateral position (m)
-%   ego_heading  - current heading (rad)
-%   ref_y        - planner lateral reference (m)
-%   ref_heading  - planner heading reference (rad)
-%   ref_speed    - planner target speed (m/s)
+% Linearized kinematic bicycle MPC
 %
-% Outputs:
-%   result.steering
-%   result.acceleration
+% States:
+%   y       - lateral position (m)
+%   heading - vehicle heading (rad)
+%   speed   - vehicle speed (m/s)
+%
+% Inputs:
+%   steering     - steering angle (rad)
+%   acceleration - longitudinal acceleration (m/s^2)
 % ============================================================
+
+%% PARAMETERS
 
 Ts = 0.1;
+wheelbase = 2.5;
+nominal_speed = 10.0;
 
-% ============================================================
-% PERSISTENT MPC OBJECT
-% ============================================================
-%
-% The MPC object is created only once.
-% Previously it was being recreated at every simulation step,
-% which caused the repeated weight/model messages.
-%
-% ============================================================
+% Keep these in function scope because they are needed on
+% every call, not only when the persistent MPC is created.
+prediction_horizon = 20;
+control_horizon = 6;
 
 persistent mpc_obj
 persistent mpc_state
 
+%% CREATE MPC ON FIRST CALL
+
 if isempty(mpc_obj)
 
-    % --------------------------------------------------------
-    % Linearized vehicle model
-    %
-    % States:
-    %   x1 = lateral position
-    %   x2 = heading
-    %   x3 = speed
-    %
-    % Inputs:
-    %   u1 = steering
-    %   u2 = acceleration
-    %
-    % Outputs:
-    %   y1 = lateral position
-    %   y2 = heading
-    %   y3 = speed
-    % --------------------------------------------------------
+    A = [1, nominal_speed*Ts, 0;
+         0, 1,                0;
+         0, 0,                1];
 
-    A = [1   Ts   0;
-         0   1    0;
-         0   0    1];
-
-    B = [0    0;
-         Ts   0;
-         0    Ts];
+    B = [0,                          0;
+         nominal_speed/wheelbase*Ts, 0;
+         0,                          Ts];
 
     C = eye(3);
-
     D = zeros(3,2);
 
     plant = ss(A,B,C,D,Ts);
 
-    % --------------------------------------------------------
-    % MPC configuration
-    % --------------------------------------------------------
-
-    prediction_horizon = 15;
-    control_horizon = 5;
+    warning_state = warning;
+    warning('off','all');
 
     mpc_obj = mpc( ...
         plant, ...
@@ -85,93 +62,73 @@ if isempty(mpc_obj)
         prediction_horizon, ...
         control_horizon);
 
-    % --------------------------------------------------------
-    % MPC weights
-    % --------------------------------------------------------
+    warning(warning_state);
 
-    mpc_obj.Weights.OutputVariables = ...
-        [5 3 1];
+    % Tracking priorities:
+    % lateral position > heading > speed
+    mpc_obj.Weights.OutputVariables = [12 10 0.5];
 
-    mpc_obj.Weights.ManipulatedVariables = ...
-        [0.1 0.05];
+    % Control effort penalties
+    mpc_obj.Weights.ManipulatedVariables = [0.10 0.05];
 
-    mpc_obj.Weights.ManipulatedVariablesRate = ...
-        [0.5 0.2];
+    % Steering-rate penalty for smoother steering
+    mpc_obj.Weights.ManipulatedVariablesRate = [2.0 0.25];
 
-    % --------------------------------------------------------
     % Steering limits
-    % --------------------------------------------------------
-
     mpc_obj.MV(1).Min = deg2rad(-30);
     mpc_obj.MV(1).Max = deg2rad(30);
 
-    % --------------------------------------------------------
     % Acceleration limits
-    % --------------------------------------------------------
-
     mpc_obj.MV(2).Min = -6;
     mpc_obj.MV(2).Max = 2;
 
-    % --------------------------------------------------------
-    % Vehicle speed limits
-    % --------------------------------------------------------
-
+    % Speed limits
     mpc_obj.OV(3).Min = 0;
     mpc_obj.OV(3).Max = 15;
 
-    % --------------------------------------------------------
-    % Create MPC state only once
-    % --------------------------------------------------------
-
     mpc_state = mpcstate(mpc_obj);
-
 end
 
+%% INPUT SANITIZATION
 
-% ============================================================
-% CURRENT VEHICLE OUTPUT
-% ============================================================
+if ~isfinite(ego_speed)
+    ego_speed = nominal_speed;
+end
 
-current_output = [ ...
-    ego_y;
-    ego_heading;
-    ego_speed];
+if ~isfinite(ego_y)
+    ego_y = 0;
+end
 
+if ~isfinite(ego_heading)
+    ego_heading = 0;
+end
 
-% ============================================================
-% REFERENCE TRAJECTORY
-% ============================================================
+if ~isfinite(ref_y)
+    ref_y = ego_y;
+end
 
-% MPC prediction horizon = 15
-%
-% Each row:
-%   [lateral position, heading, speed]
-%
-% For this MVP, the planner reference is held over the
-% prediction horizon.
-% ============================================================
+if ~isfinite(ref_heading)
+    ref_heading = 0;
+end
+
+if ~isfinite(ref_speed)
+    ref_speed = ego_speed;
+end
+
+%% CURRENT VEHICLE STATE
+
+current_output = [ego_y, ego_heading, ego_speed];
+
+%% REFERENCE OVER COMPLETE PREDICTION HORIZON
 
 y_reference = repmat( ...
-    [ref_y ref_heading ref_speed], ...
-    15, ...
+    [ref_y, ref_heading, ref_speed], ...
+    prediction_horizon, ...
     1);
 
-
-% ============================================================
-% MPC CONTROL CALCULATION
-% ============================================================
+%% MPC CONTROL
 
 try
-
-    % --------------------------------------------------------
-    % IMPORTANT:
-    %
-    % mpcmove returns:
-    %
-    %   [mv,info]
-    %
-    % NOT three output arguments.
-    % --------------------------------------------------------
 
     [mv, info] = mpcmove( ...
         mpc_obj, ...
@@ -179,18 +136,10 @@ try
         current_output, ...
         y_reference);
 
-    % --------------------------------------------------------
-    % Extract control commands
-    % --------------------------------------------------------
-
     steering = mv(1);
-
     acceleration = mv(2);
 
-    % --------------------------------------------------------
-    % Safety saturation
-    % --------------------------------------------------------
-
+    % Hard safety constraints
     steering = max( ...
         deg2rad(-30), ...
         min(deg2rad(30), steering));
@@ -203,54 +152,47 @@ try
 
 catch ME
 
-    % --------------------------------------------------------
     % Fail-safe behavior
-    %
-    % If MPC genuinely fails, stop the vehicle safely.
-    % --------------------------------------------------------
-
     steering = 0;
-
     acceleration = -6;
 
     controller_status = "MPC FAIL-SAFE";
-
     info = [];
 
-    warning( ...
-        "MPC failed: %s", ...
-        ME.message);
-
+    warning("MPC failed: %s", ME.message);
 end
 
+%% TRACKING ERRORS
 
-% ============================================================
-% RESULT STRUCTURE
-% ============================================================
+lateral_error = ref_y - ego_y;
+heading_error = ref_heading - ego_heading;
+speed_error = ref_speed - ego_speed;
+
+%% RESULT STRUCTURE
 
 result = struct();
 
-% Control commands
 result.steering = steering;
 result.acceleration = acceleration;
-
-% Steering in degrees for dashboard/plots
 result.steering_deg = rad2deg(steering);
 
-% Controller status
 result.controller_status = controller_status;
 
-% Planner reference
 result.reference_y = ref_y;
 result.reference_heading = ref_heading;
 result.reference_speed = ref_speed;
 
-% Current vehicle state
 result.current_y = ego_y;
 result.current_heading = ego_heading;
 result.current_speed = ego_speed;
 
-% MPC information
+result.lateral_error = lateral_error;
+result.heading_error = heading_error;
+result.speed_error = speed_error;
+
+result.prediction_horizon = prediction_horizon;
+result.control_horizon = control_horizon;
+
 result.mpc_info = info;
 
 end
